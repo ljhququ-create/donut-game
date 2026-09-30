@@ -1,1 +1,424 @@
 
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/dodgegame app/src/main/res/drawable app/src/main/res/mipmap-xxxhdpi app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF_X'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "DodgeGame"
+          include(":app")
+          EOF_X
+
+          cat > build.gradle.kts <<'EOF_X'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_X
+
+          cat > gradle.properties <<'EOF_X'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF_X
+
+          cat > app/build.gradle.kts <<'EOF_X'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.dodgegame"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.dodgegame"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+          }
+          EOF_X
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_X
+
+          cat > app/src/main/res/values/strings.xml <<'EOF_X'
+          <resources>
+              <string name="app_name">도넛 피하기</string>
+          </resources>
+          EOF_X
+
+          cat > app/src/main/java/com/example/dodgegame/MainActivity.kt <<'EOF_X'
+          package com.example.dodgegame
+
+          import android.os.Bundle
+          import android.view.WindowManager
+          import androidx.activity.ComponentActivity
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  // 게임 중 화면 꺼짐 방지
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  setContentView(GameView(this))
+
+                  // 상태바/내비게이션바 숨김 (전체화면), 가장자리 스와이프 시 잠깐 표시
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  WindowInsetsControllerCompat(window, window.decorView).apply {
+                      hide(WindowInsetsCompat.Type.systemBars())
+                      systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+              }
+          }
+          EOF_X
+
+          cat > app/src/main/java/com/example/dodgegame/GameView.kt <<'EOF_X'
+          package com.example.dodgegame
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.view.MotionEvent
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import kotlin.math.min
+          import kotlin.random.Random
+
+          /**
+           * 터치 피하기 게임
+           * - 손가락으로 좌우 드래그해서 아래쪽 공을 움직임
+           * - 위에서 떨어지는 이미지(obstacle.png)를 피하면 생존 시간(초)이 점수
+           * - 시간이 지날수록 블록이 빨라지고 많아짐
+           * - 최고 기록은 기기에 저장됨
+           */
+          class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback, Runnable {
+
+              private enum class State { READY, PLAYING, PAUSED, OVER }
+
+              private class Obstacle(var x: Float, var y: Float, val w: Float, val h: Float, val speed: Float)
+
+              private val lock = Any()
+              private var thread: Thread? = null
+              @Volatile private var running = false
+
+              private var state = State.READY
+              private var initialized = false
+              private var screenW = 0f
+              private var screenH = 0f
+
+              private val obstacles = mutableListOf<Obstacle>()
+              private var playerX = 0f
+              private var playerY = 0f
+              private var playerR = 0f
+              private var targetX = 0f
+
+              private var elapsed = 0f
+              private var spawnTimer = 0f
+              private var overAt = 0L
+              private var best = 0
+
+              private val prefs = context.getSharedPreferences("dodge_game", Context.MODE_PRIVATE)
+
+              private val playerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0, 229, 255) }
+              // res/drawable/obstacle.png 이미지를 장애물로 사용
+              private val obstacleBitmap: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.obstacle)
+              private val imgRatio = obstacleBitmap.height.toFloat() / obstacleBitmap.width  // 세로/가로 비율 유지
+              private val bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textAlign = Paint.Align.CENTER
+              }
+              private val dimPaint = Paint().apply { color = Color.argb(160, 0, 0, 0) }
+              private val rect = RectF()
+
+              init {
+                  holder.addCallback(this)
+                  best = prefs.getInt("best", 0)
+              }
+
+              // ---------- Surface 생명주기 ----------
+
+              override fun surfaceCreated(holder: SurfaceHolder) {
+                  running = true
+                  thread = Thread(this).also { it.start() }
+              }
+
+              override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+                  synchronized(lock) {
+                      screenW = w.toFloat()
+                      screenH = h.toFloat()
+                      playerR = screenW * 0.05f
+                      playerY = screenH * 0.85f
+                      textPaint.textSize = screenW * 0.07f
+                      if (!initialized) {
+                          resetGame()
+                          initialized = true
+                      }
+                  }
+              }
+
+              override fun surfaceDestroyed(holder: SurfaceHolder) {
+                  running = false
+                  synchronized(lock) { if (state == State.PLAYING) state = State.PAUSED }
+                  try { thread?.join() } catch (_: InterruptedException) { }
+                  thread = null
+              }
+
+              // ---------- 게임 루프 ----------
+
+              override fun run() {
+                  var last = System.nanoTime()
+                  while (running) {
+                      val now = System.nanoTime()
+                      val dt = ((now - last) / 1_000_000_000f).coerceAtMost(0.05f)
+                      last = now
+
+                      synchronized(lock) { if (initialized) update(dt) }
+
+                      val canvas = holder.lockCanvas()
+                      if (canvas == null) {
+                          Thread.sleep(16)
+                          continue
+                      }
+                      try {
+                          synchronized(lock) { render(canvas) }
+                      } finally {
+                          holder.unlockCanvasAndPost(canvas)
+                      }
+                  }
+              }
+
+              private fun resetGame() {
+                  obstacles.clear()
+                  elapsed = 0f
+                  spawnTimer = 0.5f
+                  playerX = screenW / 2f
+                  targetX = playerX
+                  state = State.READY
+              }
+
+              private fun update(dt: Float) {
+                  if (state != State.PLAYING) return
+
+                  elapsed += dt
+                  // 손가락 위치로 부드럽게 따라가기
+                  playerX += (targetX - playerX) * min(1f, dt * 15f)
+
+                  // 난이도: 15초마다 1단계씩 상승, 최대 4배
+                  val difficulty = (1f + elapsed / 15f).coerceAtMost(4f)
+
+                  spawnTimer -= dt
+                  if (spawnTimer <= 0f) {
+                      spawnTimer = (0.8f / difficulty).coerceAtLeast(0.18f)
+                      // 이미지 가로폭: 화면 폭의 12~20%, 세로는 원본 비율대로
+                      val w = screenW * (0.12f + Random.nextFloat() * 0.08f)
+                      val h = w * imgRatio
+                      val speed = screenH * (0.35f + Random.nextFloat() * 0.25f) * difficulty
+                      obstacles.add(Obstacle(Random.nextFloat() * (screenW - w), -h, w, h, speed))
+                  }
+
+                  val iter = obstacles.iterator()
+                  while (iter.hasNext()) {
+                      val o = iter.next()
+                      o.y += o.speed * dt
+                      if (o.y > screenH) {
+                          iter.remove()
+                          continue
+                      }
+                      if (hits(o)) {
+                          gameOver()
+                          return
+                      }
+                  }
+              }
+
+              /** 원(플레이어)과 이미지 사각형 충돌 판정 (억울하지 않도록 판정 영역을 10%씩 안쪽으로) */
+              private fun hits(o: Obstacle): Boolean {
+                  val insetX = o.w * 0.1f
+                  val insetY = o.h * 0.1f
+                  val cx = playerX.coerceIn(o.x + insetX, o.x + o.w - insetX)
+                  val cy = playerY.coerceIn(o.y + insetY, o.y + o.h - insetY)
+                  val dx = playerX - cx
+                  val dy = playerY - cy
+                  return dx * dx + dy * dy < playerR * playerR
+              }
+
+              private fun gameOver() {
+                  state = State.OVER
+                  overAt = System.currentTimeMillis()
+                  val score = elapsed.toInt()
+                  if (score > best) {
+                      best = score
+                      prefs.edit().putInt("best", best).apply()
+                  }
+              }
+
+              // ---------- 그리기 ----------
+
+              private fun render(c: Canvas) {
+                  c.drawColor(Color.rgb(18, 18, 30))
+                  if (!initialized) return
+
+                  for (o in obstacles) {
+                      rect.set(o.x, o.y, o.x + o.w, o.y + o.h)
+                      c.drawBitmap(obstacleBitmap, null, rect, bitmapPaint)
+                  }
+                  c.drawCircle(playerX, playerY, playerR, playerPaint)
+
+                  val lineH = textPaint.textSize * 1.4f
+                  c.drawText("${elapsed.toInt()}초    최고 ${best}초", screenW / 2f, lineH * 1.5f, textPaint)
+
+                  val lines = when (state) {
+                      State.READY -> listOf("좌우로 드래그해서 피하세요", "터치해서 시작")
+                      State.PAUSED -> listOf("일시정지", "터치해서 계속")
+                      State.OVER -> listOf("게임 오버", "${elapsed.toInt()}초 생존", "터치해서 다시")
+                      State.PLAYING -> emptyList()
+                  }
+                  if (lines.isNotEmpty()) {
+                      c.drawRect(0f, 0f, screenW, screenH, dimPaint)
+                      var y = screenH / 2f - lineH * (lines.size - 1) / 2f
+                      for (line in lines) {
+                          c.drawText(line, screenW / 2f, y, textPaint)
+                          y += lineH
+                      }
+                  }
+              }
+
+              // ---------- 터치 입력 ----------
+
+              private fun clampX(x: Float) = x.coerceIn(playerR, screenW - playerR)
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  synchronized(lock) {
+                      if (!initialized) return true
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> when (state) {
+                              State.READY, State.PAUSED -> {
+                                  state = State.PLAYING
+                                  targetX = clampX(e.x)
+                              }
+                              State.PLAYING -> targetX = clampX(e.x)
+                              // 게임 오버 직후 실수로 바로 재시작되지 않도록 0.6초 대기
+                              State.OVER -> if (System.currentTimeMillis() - overAt > 600) resetGame()
+                          }
+                          MotionEvent.ACTION_MOVE -> if (state == State.PLAYING) targetX = clampX(e.x)
+                          MotionEvent.ACTION_UP -> performClick()
+                      }
+                  }
+                  return true
+              }
+
+              override fun performClick(): Boolean {
+                  super.performClick()
+                  return true
+              }
+          }
+          EOF_X
+
+
+      - name: Prepare images
+        run: |
+          IMG=$(ls *.png *.jpg *.jpeg *.PNG *.JPG 2>/dev/null | head -n 1)
+          echo "Using image: $IMG"
+          command -v convert || (sudo apt-get update && sudo apt-get install -y imagemagick)
+          convert "$IMG" -resize 256x app/src/main/res/drawable/obstacle.png
+          convert "$IMG" -resize 1024x -crop 420x420+380+290 +repage -resize 192x192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build APK
+        run: |
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk DonutDodge.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: 도넛 피하기 빌드 ${{ github.run_number }}
+          files: DonutDodge.apk
